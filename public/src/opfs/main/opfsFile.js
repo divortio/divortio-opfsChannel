@@ -10,6 +10,7 @@ import {
 } from '../lib/utils.js';
 
 import { OPFSDir } from './opfsDir.js';
+import { BaseOPFSEntity } from '../lib/baseOPFS.js'; // <-- Dependency on BaseOPFSEntity
 
 /**
  * @typedef {FileSystemFileHandle} FileHandle
@@ -18,17 +19,11 @@ import { OPFSDir } from './opfsDir.js';
  * @typedef {number} ByteOffset
  * @typedef {string} FilePath
  * @typedef {ArrayBuffer|Uint8Array|ArrayBufferView} WriteData
+ * @typedef {import('../OPFSNotifier.js').OPFSNotifier} OPFSNotifier
  */
 
 
-export class OPFSFile {
-
-    /**
-     * Internal Map to cache expensive property results (e.g., bytes, sha256).
-     * @private
-     * @type {Map<string, any>}
-     */
-    _cache = new Map();
+export class OPFSFile extends BaseOPFSEntity {
 
     /**
      * Promise resolving to the FileSystemFileHandle. Lazy-loaded.
@@ -38,54 +33,18 @@ export class OPFSFile {
     _fileHandlePromise = null;
 
     /**
-     * The full path to the file (e.g., '/data/image.png').
-     * @private
-     * @type {FilePath}
-     */
-    _path = '';
-
-    /**
      * Initializes the OPFSFile instance.
      * @param {FilePath} filePath - The full path to the file.
+     * @param {OPFSNotifier|null} [notifier=null] - The injected notifier instance.
      */
-    constructor(filePath) {
-        if (typeof filePath !== 'string' || !filePath) {
-            throw new Error('OPFSFile requires a non-empty file path.');
-        }
-        this._path = filePath;
+    constructor(filePath, notifier = null) {
+        // Call BaseOPFSEntity(path, isDirectory, notifier)
+        super(filePath, false, notifier);
     }
 
     // =========================================================================
     // Private Utilities
     // =========================================================================
-
-    /**
-     * Clears the property cache for values invalidated by modification or deletion.
-     * @private
-     */
-    _clearCache() {
-        this._cache.delete('bytes');
-        this._cache.delete('bytesH');
-        this._cache.delete('exists');
-        this._cache.delete('sha256');
-        this._cache.delete('lastModified');
-    }
-
-    /**
-     * Retrieves the cached value for a key, or computes and caches it using a generator function.
-     * @private
-     * @param {string} key - The cache key.
-     * @param {function(): Promise<any>} generatorFn - The asynchronous function to run if the key is not in cache.
-     * @returns {Promise<any>}
-     */
-    async _getOrCache(key, generatorFn) {
-        if (this._cache.has(key)) {
-            return this._cache.get(key);
-        }
-        const result = await generatorFn();
-        this._cache.set(key, result);
-        return result;
-    }
 
     /**
      * Lazy-loads or retrieves the FileSystemFileHandle promise.
@@ -132,7 +91,6 @@ export class OPFSFile {
         }
 
         const fileHandle = await this._getHandlePromise();
-        // CRITICAL FIX 2: Get the file object once for slicing
         const file = await fileHandle.getFile();
 
         // Use slice for partial read
@@ -146,46 +104,53 @@ export class OPFSFile {
 
     /**
      * Writes the contents of data to the file using the Writable Stream API.
+     * NOTE: This method implicitly creates parent directories if they do not exist.
      * @param {WriteData} data - The data to write (ArrayBuffer, Uint8Array, etc.).
      * @param {ByteOffset} [position=0] - The byte offset to start writing at.
      * @returns {Promise<void>}
      */
     async writeBytes(data, position = 0) {
+        const fileExisted = await this.exists;
+
         // Force creation of file and parent directories if writing to a new path
         const fileHandle = await this._getHandlePromise(true);
 
-        // 1. Get original file size (for accurate truncation check)
         const originalSize = await this.bytes;
         const dataLength = data.byteLength || (data.length * data.BYTES_PER_ELEMENT) || 0;
 
-        // 2. Create the Writable Stream
         const writable = await fileHandle.createWritable();
 
         try {
-            // 3. Write the data
             await writable.write({
                 type: 'write',
                 data: data,
                 position: position
             });
 
-            // CRITICAL FIX 1: Truncate only if the write ended before the original EOF
             const newEnd = position + dataLength;
 
             if (newEnd < originalSize) {
                 await writable.truncate(newEnd);
             }
 
-            // 4. Close the stream to commit changes (CRITICAL)
             await writable.close();
 
         } catch (error) {
-            // Ensure the stream is aborted/closed on failure
             await writable.abort();
             throw error;
         }
 
         this._clearCache();
+
+        // Notification Logic
+        if (this.notifier) {
+            const bytesH = await this.bytesH;
+            if (!fileExisted) {
+                this.notifier.fileCreated(this.path, bytesH);
+            } else {
+                this.notifier.fileModified(this.path, bytesH); // Modification includes overwrite/append
+            }
+        }
     }
 
     /**
@@ -210,6 +175,7 @@ export class OPFSFile {
 
     /**
      * Fetches data from a Blob URL or standard URL and writes it to the file.
+     * NOTE: This operation implicitly creates parent directories for the destination path.
      * @param {string} url - The Blob URL or standard URL.
      * @returns {Promise<void>}
      */
@@ -233,6 +199,8 @@ export class OPFSFile {
             throw new Error('Cannot delete the root directory.');
         }
 
+        const deletedPath = this.path;
+
         this._clearCache();
         const { filename } = parsePath(this._path);
 
@@ -240,10 +208,16 @@ export class OPFSFile {
         await parentDir.deleteFile(filename);
 
         this._fileHandlePromise = null;
+
+        // Notification Logic
+        if (this.notifier) {
+            this.notifier.fileDeleted(deletedPath);
+        }
     }
 
     /**
      * Copies the file to a new path.
+     * NOTE: This operation implicitly creates parent directories for the destination path.
      * @param {FilePath} newPath - The destination path.
      * @returns {Promise<OPFSFile>} A new instance representing the copied file.
      */
@@ -251,20 +225,31 @@ export class OPFSFile {
         // Read all content
         const data = await this.readBytes();
 
-        // Write to new location using new OPFSFile instance
-        const newFile = new OPFSFile(newPath);
-        await newFile.writeBytes(data, 0);
+        // Pass notifier to the new file instance
+        const newFile = new OPFSFile(newPath, this.notifier);
+        await newFile.writeBytes(data, 0); // writeBytes handles creation/modification notification
         return newFile;
     }
 
     /**
      * Moves the file to a new path (implemented as copy then delete).
+     * NOTE: This operation implicitly creates parent directories for the destination path.
      * @param {FilePath} newPath - The destination path.
      * @returns {Promise<void>}
      */
     async move(newPath) {
+        const oldPath = this.path;
+
+        // Pass notifier to the copy operation
         await this.copy(newPath);
+
+        // Delete the original (which notifies deletion internally)
         await this.delete();
+
+        // Notification Logic for the move event itself
+        if (this.notifier) {
+            this.notifier.entryMoved(oldPath, newPath, 'file');
+        }
     }
 
     /**
@@ -288,6 +273,12 @@ export class OPFSFile {
         }
 
         this._clearCache();
+
+        // Notification Logic: Allocation is a file modification
+        if (this.notifier) {
+            const bytesH = await this.bytesH;
+            this.notifier.fileModified(this.path, bytesH);
+        }
     }
 
     // =========================================================================
@@ -333,29 +324,7 @@ export class OPFSFile {
         });
     }
 
-    /**
-     * Gets the full file name with extension. Synchronous (path-derived).
-     * @type {string}
-     */
-    get filename() {
-        return parsePath(this._path).filename;
-    }
-
-    /**
-     * Gets the full file path. Synchronous (constructor input).
-     * @type {FilePath}
-     */
-    get path() {
-        return this._path;
-    }
-
-    /**
-     * Gets the path of the containing directory. Lazy-loaded and cached.
-     * @type {Promise<string>}
-     */
-    get dirname() {
-        return this._getOrCache('dirname', async () => parsePath(this._path).dirname);
-    }
+    // Path properties (path, filename, dirname, extension) inherited from BaseOPFSEntity
 
     /**
      * Returns an initialized OPFSDir instance for the parent directory. Cached.
@@ -364,16 +333,9 @@ export class OPFSFile {
     get parentDir() {
         return this._getOrCache('parentDir', async () => {
             const dirPath = await this.dirname;
-            return new OPFSDir(dirPath);
+            // Pass the notifier to the parent directory instance
+            return new OPFSDir(dirPath, this.notifier);
         });
-    }
-
-    /**
-     * Gets the file extension only (e.g., 'png'). Lazy-loaded and cached.
-     * @type {Promise<string>}
-     */
-    get extension() {
-        return this._getOrCache('extension', async () => parsePath(this._path).extension);
     }
 
     /**
@@ -385,13 +347,25 @@ export class OPFSFile {
     }
 
     /**
-     * Calculates the SHA-256 hash of the entire file content. Expensive, cached.
+     * Calculates the SHA-256 hash of the entire file content using the streaming
+     * Web Crypto API to ensure memory efficiency for large files.
      * @type {Promise<string>} Hexadecimal hash string.
      */
     get sha256() {
         return this._getOrCache('sha256', async () => {
-            const buffer = await this.readBytes();
-            return calculateSHA256(buffer);
+            if (!await this.exists) return '';
+
+            // 1. Get File Handle and File object
+            const fileHandle = await this._getHandlePromise();
+            const file = await fileHandle.getFile();
+
+            // 2. Use streaming for memory efficiency
+            const hashBuffer = await crypto.subtle.digest('SHA-256', file.stream());
+
+            // Convert ArrayBuffer to hex string
+            return Array.from(new Uint8Array(hashBuffer))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
         });
     }
 

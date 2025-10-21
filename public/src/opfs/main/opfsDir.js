@@ -9,21 +9,16 @@ import {
 } from '../lib/utils.js';
 
 import { OPFSFile } from './opfsFile.js';
+import { BaseOPFSEntity } from '../lib/baseOPFS.js';
 
 /**
  * @typedef {import('../lib/utils.js').DirHandle} DirHandle
  * @typedef {import('../lib/utils.js').PathInfo} PathInfo
  * @typedef {string} FilePath
+ * @typedef {import('../OPFSNotifier.js').OPFSNotifier} OPFSNotifier
  */
 
-export class OPFSDir {
-
-    /**
-     * Internal Map to cache expensive property results (e.g., exists, count).
-     * @private
-     * @type {Map<string, any>}
-     */
-    _cache = new Map();
+export class OPFSDir extends BaseOPFSEntity {
 
     /**
      * Promise resolving to the FileSystemDirectoryHandle. Lazy-loaded.
@@ -33,55 +28,19 @@ export class OPFSDir {
     _dirHandlePromise = null;
 
     /**
-     * The full path to the directory (always ends with '/').
-     * @private
-     * @type {FilePath}
-     */
-    _path = '';
-
-    /**
      * Initializes the OPFSDir instance.
      * NOTE: This is a synchronous operation; no I/O is performed here.
      * @param {FilePath} directoryPath - The full path to the directory (e.g., '/data/images/').
+     * @param {OPFSNotifier|null} [notifier=null] - The injected notifier instance.
      */
-    constructor(directoryPath) {
-        if (typeof directoryPath !== 'string' || !directoryPath) {
-            throw new Error('OPFSDir requires a non-empty directory path.');
-        }
-        // Normalize path to ensure it ends with a slash, unless it's the root.
-        this._path = directoryPath.endsWith('/') ? directoryPath : directoryPath + '/';
+    constructor(directoryPath, notifier = null) {
+        // Call BaseOPFSEntity(path, isDirectory, notifier)
+        super(directoryPath, true, notifier);
     }
 
     // =========================================================================
     // Private Utilities
     // =========================================================================
-
-    /**
-     * Clears the property cache for values invalidated by modification or deletion.
-     * @private
-     */
-    _clearCache() {
-        this._cache.delete('exists');
-        this._cache.delete('count');
-        this._cache.delete('isEmpty');
-        this._cache.delete('files'); // The list of entries
-    }
-
-    /**
-     * Retrieves the cached value for a key, or computes and caches it using a generator function.
-     * @private
-     * @param {string} key - The cache key.
-     * @param {function(): Promise<any>} generatorFn - The asynchronous function to run if the key is not in cache.
-     * @returns {Promise<any>}
-     */
-    async _getOrCache(key, generatorFn) {
-        if (this._cache.has(key)) {
-            return this._cache.get(key);
-        }
-        const result = await generatorFn();
-        this._cache.set(key, result);
-        return result;
-    }
 
     /**
      * Lazy-loads or retrieves the FileSystemDirectoryHandle promise.
@@ -91,13 +50,53 @@ export class OPFSDir {
      * @returns {Promise<DirHandle>}
      */
     async _getHandlePromise(create = false) {
+        const wasCreated = create && !await this.exists;
+
         if (!this._dirHandlePromise || create) {
             this._dirHandlePromise = getDirHandle(this._path, create).catch(e => {
                 this._dirHandlePromise = null;
                 throw e;
             });
         }
+
+        // Notification Logic
+        if (wasCreated && this.notifier) {
+            this.notifier.dirCreated(this.path);
+        }
+
         return this._dirHandlePromise;
+    }
+
+    /**
+     * @private
+     * Recursively copies the contents of this directory to a new directory path.
+     * @param {FilePath} newPath - The full path of the destination directory (must end with '/').
+     * @returns {Promise<void>}
+     */
+    async _copyDirRecursive(newPath) {
+        // 1. Get the destination directory (creates it and its parents if needed)
+        const destDir = new OPFSDir(newPath, this.notifier); // Pass notifier
+        // Force the destination directory path to be created (notifier handles creation event internally via _getHandlePromise)
+        await destDir._getHandlePromise(true);
+
+        // 2. List all contents
+        const entries = await this.listFiles();
+
+        // 3. Process entries
+        for (const entry of entries) {
+            const sourcePath = this._path + entry.name;
+            const destPath = newPath + entry.name;
+
+            if (entry.kind === 'file') {
+                const sourceFile = new OPFSFile(sourcePath, this.notifier); // Pass notifier
+                // OPFSFile.copy handles reading/writing and implicitly creates dest parents
+                await sourceFile.copy(destPath);
+            } else if (entry.kind === 'directory') {
+                const sourceDir = new OPFSDir(sourcePath, this.notifier); // Pass notifier
+                // Recursive call (ensure path ends with '/')
+                await sourceDir._copyDirRecursive(destPath + '/');
+            }
+        }
     }
 
 
@@ -116,7 +115,7 @@ export class OPFSDir {
             throw new Error('Filename must be a simple name, not a path.');
         }
         const filePath = this._path + filename;
-        return new OPFSFile(filePath);
+        return new OPFSFile(filePath, this.notifier); // Pass notifier
     }
 
     /**
@@ -130,7 +129,7 @@ export class OPFSDir {
             throw new Error('Directory name must be a simple name, not a path.');
         }
         const dirPath = this._path + dirname;
-        return new OPFSDir(dirPath);
+        return new OPFSDir(dirPath, this.notifier); // Pass notifier
     }
 
     /**
@@ -146,7 +145,7 @@ export class OPFSDir {
         try {
             // Check if it exists AND is a file
             await dirHandle.getFileHandle(name, { create: false });
-            return new OPFSFile(this._path + name);
+            return new OPFSFile(this._path + name, this.notifier); // Pass notifier
         } catch (e) {
             if (e.name === 'NotFoundError') {
                 return null;
@@ -168,7 +167,7 @@ export class OPFSDir {
         try {
             // Check if it exists AND is a directory
             await dirHandle.getDirectoryHandle(name, { create: false });
-            return new OPFSDir(this._path + name);
+            return new OPFSDir(this._path + name, this.notifier); // Pass notifier
         } catch (e) {
             if (e.name === 'NotFoundError') {
                 return null;
@@ -190,14 +189,35 @@ export class OPFSDir {
         if (!await this.exists) {
             throw new Error(`Cannot delete: Directory ${this._path} does not exist.`);
         }
+
+        const deletedPath = this._path + name;
+
         const dirHandle = await this._getHandlePromise();
         await dirHandle.removeEntry(name, { recursive });
         this._clearCache();
+
+        // Notification Logic
+        if (this.notifier) {
+            if (recursive) {
+                this.notifier.dirDeleted(deletedPath);
+            } else {
+                this.notifier.fileDeleted(deletedPath);
+            }
+        }
+    }
+
+    /**
+     * Deletes a directory and all its contents recursively.
+     * @param {string} name - The name of the subdirectory to delete.
+     * @returns {Promise<void>}
+     */
+    async deleteDir(name) {
+        return this.deleteFile(name, true);
     }
 
     /**
      * Moves a file from this directory to a new path.
-     * NOTE: This is implemented as copy-then-delete, and currently only supports files.
+     * NOTE: This method currently only supports files. Use moveDir for recursive directory moves.
      * @param {string} name - The name of the file to move.
      * @param {FilePath} newPath - The destination path (full file path).
      * @returns {Promise<void>}
@@ -221,19 +241,73 @@ export class OPFSDir {
             throw new Error(`Cannot move: Entry "${name}" not found in ${this._path}`);
         }
 
-        // 2. Perform copy operation
+        // 2. Perform copy operation (copy handles creating the destination path)
         if (isFile) {
-            // entry is an OPFSFile instance, use its copy method
-            await entry.copy(newPath);
+            await entry.copy(newPath); // copy uses the notifier
         } else {
-            // NOTE: Directory move requires recursive copy logic (future implementation)
-            throw new Error(`Directory move not currently supported. Use list/copy/delete for contents.`);
+            throw new Error(`Cannot move directory "${name}". Use moveDir for recursive directory moves.`);
         }
 
-        // 3. Delete the original (I/O)
-        // Use recursive true for safety, although the original file is empty now.
+        // 3. Delete the original (I/O). The delete method notifies deletion.
         await this.deleteFile(name, true);
         this._clearCache();
+
+        // Notification Logic for the move event itself
+        if (this.notifier) {
+            this.notifier.entryMoved(sourcePath, newPath, 'file');
+        }
+    }
+
+    /**
+     * Recursively copies this directory and all its contents to a new destination path.
+     * @param {FilePath} newPath - The destination path for the new directory.
+     * @returns {Promise<OPFSDir>} The new OPFSDir instance.
+     */
+    async copyDir(newPath) {
+        if (!await this.exists) {
+            throw new Error(`Cannot copy: Source directory ${this._path} does not exist.`);
+        }
+
+        const normalizedNewPath = newPath.endsWith('/') ? newPath : newPath + '/';
+        // _copyDirRecursive ensures destination dir is created and notifies creation events
+        await this._copyDirRecursive(normalizedNewPath);
+        this._clearCache();
+
+        return new OPFSDir(normalizedNewPath, this.notifier);
+    }
+
+    /**
+     * Recursively moves this directory and all its contents to a new destination path.
+     * @param {FilePath} newPath - The destination path for the new directory.
+     * @returns {Promise<OPFSDir>} The new OPFSDir instance.
+     */
+    async moveDir(newPath) {
+        if (this._path === '/') {
+            throw new Error('Cannot move the root directory.');
+        }
+
+        const oldPath = this.path;
+
+        // 1. Perform recursive copy
+        const newDir = await this.copyDir(newPath);
+
+        // 2. Delete original directory
+        const { dirname } = parsePath(this._path.slice(0, -1));
+        const parentDir = new OPFSDir(dirname, this.notifier);
+
+        const dirNameSegment = this._path.slice(dirname.length).slice(0, -1);
+
+        // deleteDir notifies deletion internally
+        await parentDir.deleteDir(dirNameSegment);
+
+        this._clearCache();
+
+        // Notification Logic for the move event itself
+        if (this.notifier) {
+            this.notifier.entryMoved(oldPath, newDir.path, 'directory');
+        }
+
+        return newDir;
     }
 
     /**
@@ -263,23 +337,6 @@ export class OPFSDir {
     // =========================================================================
 
     /**
-     * Gets the full, normalized path of this directory. Synchronous.
-     * @type {FilePath}
-     */
-    get path() {
-        return this._path;
-    }
-
-    /**
-     * Gets the name of the directory itself (e.g., 'images/'). Synchronous.
-     * @type {string}
-     */
-    get dirname() {
-        const { dirname } = parsePath(this._path.slice(0, -1)); // Parse parent path
-        return this._path.slice(dirname.length); // Return the final segment
-    }
-
-    /**
      * Returns an initialized OPFSDir instance for the parent directory. Cached.
      * @type {Promise<OPFSDir>}
      */
@@ -289,7 +346,8 @@ export class OPFSDir {
                 throw new Error('Cannot access parent of the root directory.');
             }
             const { dirname } = parsePath(this._path.slice(0, -1));
-            return new OPFSDir(dirname);
+            // Pass the notifier to the parent directory instance
+            return new OPFSDir(dirname, this.notifier);
         });
     }
 
@@ -300,7 +358,6 @@ export class OPFSDir {
     get exists() {
         return this._getOrCache('exists', async () => {
             try {
-                // Attempt to get the handle without creating it
                 await this._getHandlePromise(false);
                 return true;
             } catch (error) {

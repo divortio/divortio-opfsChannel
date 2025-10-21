@@ -4,9 +4,11 @@
  */
 import { OPFSFile } from './opfsFile.js';
 import { OPFSDir } from './opfsDir.js';
+import { OPFSMain } from './opfsMain.js'; // <-- NEW IMPORT
 
 // Export the core asynchronous OPFS abstraction classes
 export {
     OPFSFile,
-    OPFSDir
+    OPFSDir,
+    OPFSMain // <-- NEW EXPORT
 };

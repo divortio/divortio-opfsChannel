@@ -14,6 +14,7 @@ import {
 } from '../lib/utils.js';
 
 import { OPFSWorkerDirectory } from './opfsWorkerDir.js';
+import { BaseOPFSEntity } from '../lib/baseOPFS.js'; // <-- NEW IMPORT (Must be imported from lib)
 
 /**
  * @typedef {import('../lib/utils.js').FileHandle} FileHandle
@@ -21,18 +22,11 @@ import { OPFSWorkerDirectory } from './opfsWorkerDir.js';
  * @typedef {import('../lib/utils.js').PathInfo} PathInfo
  * @typedef {number} ByteOffset
  * @typedef {string} FilePath
+ * @typedef {import('../OPFSNotifier.js').OPFSNotifier} OPFSNotifier
  */
 
 
-export class OPFSWorkerFile {
-// ... (rest of the class implementation is correct)
-
-    /**
-     * Internal Map to cache expensive property results (e.g., bytes, sha256).
-     * @private
-     * @type {Map<string, any>}
-     */
-    _cache = new Map();
+export class OPFSWorkerFile extends BaseOPFSEntity { // <-- EXTENDS BaseOPFSEntity
 
     /**
      * Promise resolving to the FileSystemFileHandle. Lazy-loaded.
@@ -49,54 +43,18 @@ export class OPFSWorkerFile {
     _accessHandle = null;
 
     /**
-     * The full path to the file (e.g., '/data/image.png').
-     * @private
-     * @type {FilePath}
-     */
-    _path = '';
-
-    /**
      * Initializes the OPFSWorkerFile instance.
      * @param {FilePath} filePath - The full path to the file.
+     * @param {OPFSNotifier|null} [notifier=null] - The injected notifier instance.
      */
-    constructor(filePath) {
-        if (typeof filePath !== 'string' || !filePath) {
-            throw new Error('OPFSWorkerFile requires a non-empty file path.');
-        }
-        this._path = filePath;
+    constructor(filePath, notifier = null) {
+        // Call BaseOPFSEntity(path, isDirectory, notifier)
+        super(filePath, false, notifier);
     }
 
     // =========================================================================
     // Private Utilities
     // =========================================================================
-
-    /**
-     * Clears the property cache for values invalidated by modification or deletion.
-     * @private
-     */
-    _clearCache() {
-        this._cache.delete('bytes');
-        this._cache.delete('bytesH');
-        this._cache.delete('exists');
-        this._cache.delete('sha256');
-        this._cache.delete('lastModified');
-    }
-
-    /**
-     * Retrieves the cached value for a key, or computes and caches it using a generator function.
-     * @private
-     * @param {string} key - The cache key.
-     * @param {function(): Promise<any>} generatorFn - The asynchronous function to run if the key is not in cache.
-     * @returns {Promise<any>}
-     */
-    async _getOrCache(key, generatorFn) {
-        if (this._cache.has(key)) {
-            return this._cache.get(key);
-        }
-        const result = await generatorFn();
-        this._cache.set(key, result);
-        return result;
-    }
 
     /**
      * Lazy-loads or retrieves the FileSystemFileHandle promise.
@@ -158,28 +116,40 @@ export class OPFSWorkerFile {
 
     /**
      * Writes the contents of a Uint8Array to the file.
+     * NOTE: This method implicitly creates parent directories if they do not exist.
      * @param {Uint8Array} data - The data to write.
      * @param {ByteOffset} [position=0] - The byte offset to start writing at.
      * @returns {Promise<void>}
      */
     async writeBytes(data, position = 0) {
-        if (!(data instanceof Uint8Array)) {
-            throw new TypeError('Data must be a Uint8Array view.');
-        }
+        const fileExisted = await this.exists;
+
+        // Force creation of file and parent directories if writing to a new path
         const handle = await this._getHandlePromise(true);
 
-        await withSyncAccessHandle(handle, handle => {
-            const bytesWritten = handle.write(data, { at: position });
+        await withSyncAccessHandle(handle, syncHandle => {
+            const bytesWritten = syncHandle.write(data, { at: position });
 
             if (bytesWritten !== data.length) {
                 throw new Error(`Failed to write all data. Wrote ${bytesWritten} of ${data.length} bytes.`);
             }
 
-            if (position + data.length < handle.getSize()) {
-                handle.truncate(position + data.length);
+            if (position + data.length < syncHandle.getSize()) {
+                syncHandle.truncate(position + data.length);
             }
         });
         this._clearCache();
+
+        // Notification Logic
+        if (this.notifier) {
+            // Await the cached property fetch only after I/O is done
+            const bytesH = await this.bytesH;
+            if (!fileExisted) {
+                this.notifier.fileCreated(this.path, bytesH);
+            } else {
+                this.notifier.fileModified(this.path, bytesH); // Modification includes overwrite/append
+            }
+        }
     }
 
     /**
@@ -257,6 +227,8 @@ export class OPFSWorkerFile {
             throw new Error('Cannot delete the root directory. Use deleteFile(name) on its parent.');
         }
 
+        const deletedPath = this.path;
+
         this._clearCache();
         const { filename } = parsePath(this._path);
 
@@ -264,28 +236,46 @@ export class OPFSWorkerFile {
         await parentDir.deleteFile(filename);
 
         this._fileHandlePromise = null; // Invalidate handle
+
+        // Notification Logic
+        if (this.notifier) {
+            this.notifier.fileDeleted(deletedPath);
+        }
     }
 
     /**
      * Copies the file to a new path.
+     * NOTE: This operation implicitly creates parent directories for the destination path.
      * @param {FilePath} newPath - The destination path.
      * @returns {Promise<OPFSWorkerFile>} A new instance representing the copied file.
      */
     async copy(newPath) {
         const data = await this.readBytes();
-        const newFile = new OPFSWorkerFile(newPath);
-        await newFile.writeBytes(data, 0);
+        // Pass notifier to the new file instance
+        const newFile = new OPFSWorkerFile(newPath, this.notifier);
+        await newFile.writeBytes(data, 0); // writeBytes handles creation notification
         return newFile;
     }
 
     /**
      * Moves the file to a new path (implemented as copy then delete).
+     * NOTE: This operation implicitly creates parent directories for the destination path.
      * @param {FilePath} newPath - The destination path.
      * @returns {Promise<void>}
      */
     async move(newPath) {
+        const oldPath = this.path;
+
+        // Pass notifier to the copy operation
         await this.copy(newPath);
+
+        // Delete the original (which notifies deletion internally)
         await this.delete();
+
+        // Notification Logic for the move event itself
+        if (this.notifier) {
+            this.notifier.entryMoved(oldPath, newPath, 'file');
+        }
     }
 
     /**
@@ -297,13 +287,19 @@ export class OPFSWorkerFile {
         if (typeof size !== 'number' || size < 0) {
             throw new TypeError('Size must be a non-negative number.');
         }
-        const handle = await this._getHandlePromise(true);
+        const fileHandle = await this._getHandlePromise(true);
 
-        await withSyncAccessHandle(handle, h => {
+        await withSyncAccessHandle(fileHandle, h => {
             h.truncate(size);
         });
 
         this._clearCache();
+
+        // Notification Logic: Allocation is a file modification
+        if (this.notifier) {
+            const bytesH = await this.bytesH;
+            this.notifier.fileModified(this.path, bytesH);
+        }
     }
 
     /**
@@ -329,6 +325,12 @@ export class OPFSWorkerFile {
             }
             this._accessHandle = null;
             this._clearCache();
+
+            // Notification Logic (update counts as modification)
+            if (this.notifier) {
+                const bytesH = await this.bytesH;
+                this.notifier.fileModified(this.path, bytesH);
+            }
         }
     }
 
@@ -374,29 +376,7 @@ export class OPFSWorkerFile {
         });
     }
 
-    /**
-     * Gets the full file name with extension. Synchronous (path-derived).
-     * @type {string}
-     */
-    get filename() {
-        return parsePath(this._path).filename;
-    }
-
-    /**
-     * Gets the full file path. Synchronous (constructor input).
-     * @type {FilePath}
-     */
-    get path() {
-        return this._path;
-    }
-
-    /**
-     * Gets the path of the containing directory. Lazy-loaded and cached.
-     * @type {Promise<string>}
-     */
-    get dirname() {
-        return this._getOrCache('dirname', async () => parsePath(this._path).dirname);
-    }
+    // Path properties (path, filename, dirname, extension) inherited from BaseOPFSEntity
 
     /**
      * Returns an initialized OPFSWorkerDirectory instance for the parent directory. Cached.
@@ -405,16 +385,9 @@ export class OPFSWorkerFile {
     get parentDir() {
         return this._getOrCache('parentDir', async () => {
             const dirPath = await this.dirname;
-            return new OPFSWorkerDirectory(dirPath);
+            // Pass the notifier to the parent directory instance
+            return new OPFSWorkerDirectory(dirPath, this.notifier);
         });
-    }
-
-    /**
-     * Gets the file extension only (e.g., 'png'). Lazy-loaded and cached.
-     * @type {Promise<string>}
-     */
-    get extension() {
-        return this._getOrCache('extension', async () => parsePath(this._path).extension);
     }
 
     /**

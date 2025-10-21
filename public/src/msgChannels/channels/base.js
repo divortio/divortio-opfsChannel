@@ -1,6 +1,7 @@
 /**
  * @fileoverview Defines the BaseChannel class, an object-oriented abstraction
- * It consumes the complete message class hierarchy for type safety.
+ * over the native BroadcastChannel API. It enforces a structured, traceable
+ * message class hierarchy and provides extensible primitives for subclasses.
  */
 
 import { BaseMessage } from '../messages/base.js';
@@ -13,6 +14,14 @@ import { HelloMessage } from '../messages/hello.js';
 import { GreetingMessage } from '../messages/greetings.js';
 import { GoodbyeMessage } from '../messages/goodbye.js';
 
+/**
+ * @typedef {import('../messages/base.js').BaseMessage} BaseMessage
+ * @typedef {import('../messages/messageAgent.js').MessageAgent} MessageAgent
+ *
+ * @callback MessageCallback
+ * @param {BaseMessage} message - The structured message object received.
+ * @returns {void}
+ */
 
 
 export class BaseChannel {
@@ -40,14 +49,14 @@ export class BaseChannel {
     /**
      * Map of message types to their registered callbacks.
      * @private
-     * @type {Map<string, Array<(message: BaseMessage) => void>>}
+     * @type {Map<string, Array<MessageCallback>>}
      */
     _listeners = new Map();
 
 
-
     /**
      * Initializes the BaseChannel, creating the native BroadcastChannel instance.
+     * Registers the private handshake handler and error handler.
      * @param {string} channelName - The unique name for this communication channel.
      * @param {string|null} [agentName=null] - Optional name for this context (e.g., 'UI').
      */
@@ -60,7 +69,13 @@ export class BaseChannel {
 
         this.agent = new MessageAgent(agentName);
         this._channel = new BroadcastChannel(channelName);
+
+        // Register native event handlers
         this._channel.onmessage = this._messageRouter.bind(this);
+        this._channel.onmessageerror = this._messageErrorHandler.bind(this);
+
+        // Register the internal handshake handler for extensibility
+        this.on(HelloMessage.msgType, this._handleHandshake.bind(this));
 
         this.hello();
     }
@@ -74,55 +89,48 @@ export class BaseChannel {
     }
 
     // =========================================================================
-    // Core Messaging and Lifecycle
+    // Core Messaging and Extensibility Primitives
     // =========================================================================
 
     /**
      * Extracts the message type string safely from a string or a message class/object.
      * @private
-     * @param {string|{msgType: string}} type - The input type definition.
+     * @param {string|{msgType: string}} type - The input type definition (string or class with static msgType).
      * @returns {string} The resolved message type string.
      */
     _getTypeString(type) {
         if (typeof type === 'string' && type.length > 0) {
             return type;
         }
-        if (typeof type === 'object' && 'msgType' in type && typeof type.msgType === 'string' && type.msgType.length > 0) {
+        // Handle class objects with a static msgType property
+        if (typeof type === 'function' && 'msgType' in type && typeof type.msgType === 'string' && type.msgType.length > 0) {
             return type.msgType;
         }
-        throw new Error('Invalid type specified. Must be a string or an object/class with a valid static msgType property.');
-    }
-
-    /**
-     * The single router for all incoming messages from the native BroadcastChannel.
-     * @private
-     * @param {object} msg - The native message event.
-     * @returns {BaseMessage}
-     */
-    _getMsg(msg){
-
-        if (typeof msg == 'object' && 'type' in msg &&  msg.type !== 'string') {
-            return msg;
+        // Handle object instances with a msgType property
+        if (typeof type === 'object' && type !== null && 'msgType' in type && typeof type.msgType === 'string' && type.msgType.length > 0) {
+            return type.msgType;
         }
-
+        throw new Error('Invalid type specified. Must be a non-empty string or an object/class with a valid static msgType property.');
     }
 
     /**
      * The single router for all incoming messages from the native BroadcastChannel.
+     * NOTE: This method is a pure dispatcher/filter. Logic for handshake replies is externalized.
      * @private
      * @param {MessageEvent} event - The native message event.
      */
     _messageRouter(event) {
+        const message = event.data;
 
-        const message = this._getMsg(event.data);
-        const type = message.type;
-
-        // CRITICAL: Handshake Logic - Intercept HELLO/GOODBYE
-        if (type === HelloMessage.msgType) {
-            this.greeting(message.agentID);
+        // 1. Robust Validation (prevents crashes from malformed data)
+        if (typeof message !== 'object' || message === null || typeof message.type !== 'string' || !message.agentID) {
+            console.warn(`BaseChannel received malformed or non-protocol data, ignoring:`, message);
+            return;
         }
 
-        // 1. Direct Message Filtering
+        const type = message.type;
+
+        // 2. Direct Message Filtering
         if (message.toAgent && message.toAgent !== this.agentID) {
             return;
         }
@@ -140,21 +148,55 @@ export class BaseChannel {
         }
     }
 
+
+    /**
+     * Handles native BroadcastChannel messageerror events (serialization failure).
+     * Reports the failure using the system's ErrorMessage primitive.
+     * @private
+     * @param {MessageEvent} event - The native messageerror event.
+     */
+    _messageErrorHandler(event) {
+        // Use our structured ErrorMessage to report the native error, ensuring traceability
+        this.error(
+            `BroadcastChannel message serialization failed. Could not receive data.`,
+            { nativeError: event.error, failedData: event.data },
+            null // Broadcast the error
+        );
+    }
+
+    /**
+     * @private
+     * Handles incoming handshake messages and automatically replies to 'hello'.
+     * This decouples the handshake side effect from the core router.
+     * @param {BaseMessage} message - The incoming handshake message.
+     */
+    _handleHandshake(message) {
+        if (message.type === HelloMessage.msgType) {
+            // Auto-reply to a Hello message with a Greeting (Direct Message)
+            this.greeting(message.agentID);
+            return;
+        }
+    }
+
     /**
      * Sends a structured message across the channel. This is the foundational send utility.
-     * RENAMED from send to sendMsg.
      * @param {BaseMessage} message - The message object to post. Must be an instance of a specialized class.
      * @param {Transferable[]} [transferables=[]] - Array of objects to transfer ownership of.
      */
     sendMsg(message, transferables = []) {
+        // CRITICAL FIX: Enforce message structure at runtime
+        if (!(message instanceof BaseMessage)) {
+            throw new TypeError('Message sent to channel must be an instance of BaseMessage or one of its specialized subclasses.');
+        }
+
         this._channel.postMessage(message, transferables);
     }
 
     /**
      * Registers a listener for a specific message type.
-     * Accepts type as a string or a Message class/object.
-     * @param {string} type - The message type or message class/object to listen for.
-     * @param {(message: BaseMessage) => void} callback - The function to execute when the message is received.
+     * Accepts type as a string or a Message class/object (e.g., LogMessage).
+     * @param {string|{msgType: string}} type - The message type or message class/object to listen for.
+     * @param {MessageCallback} callback - The function to execute when the message is received.
      */
     on(type, callback) {
         const typeString = this._getTypeString(type);
@@ -166,7 +208,7 @@ export class BaseChannel {
     /**
      * Removes a specific listener function for a message type.
      * Accepts type as a string or a Message class/object.
-     * @param {string} type - The message type or message class/object.
+     * @param {string|{msgType: string}} type - The message type or message class/object.
      * @param {Function} callback - The function previously registered with `on()`.
      */
     off(type, callback) {
@@ -185,7 +227,6 @@ export class BaseChannel {
         this.goodbye(); // Announce departure
         this._channel.close();
         this._listeners.clear();
-
     }
 
     // =========================================================================
@@ -218,16 +259,12 @@ export class BaseChannel {
     }
 
 
-
-
-
     // =========================================================================
     // Symmetrical Convenience Methods (Producer)
     // =========================================================================
 
     /**
      * Sends a structured log message.
-     * Signature: message, data=null, level='info', toAgent=null
      * @param {string} message - The primary log message.
      * @param {any} [data=null] - Optional additional data/context.
      * @param {'info'|'warn'|'debug'} [level='info'] - The log level.
@@ -256,7 +293,7 @@ export class BaseChannel {
      * @param {string|null} [toAgent=null] - Direct Message target.
      */
     event(name, data = null, toAgent = null) {
-        const message = new EventMessage(this.agent, name, data, null, toAgent); // Added null for metadata
+        const message = new EventMessage(this.agent, name, data, null, toAgent);
         this.sendMsg(message);
     }
 
@@ -278,38 +315,58 @@ export class BaseChannel {
 
     /**
      * Registers a listener for system log messages.
-     * @param {(message: BaseMessage) => void} callback - Handler receives the full message object.
+     * @param {MessageCallback} callback - Handler receives the full message object.
      */
     onLog(callback) {
-        const type = LogMessage.msgType;
-        this.on(type, callback);
+        this.on(LogMessage.msgType, callback);
     }
 
     /**
      * Registers a listener for system error messages.
-     * @param {(message: BaseMessage) => void} callback - Handler receives the full message object.
+     * @param {MessageCallback} callback - Handler receives the full message object.
      */
     onError(callback) {
-        const type = ErrorMessage.msgType;
-        this.on(type, callback);
+        this.on(ErrorMessage.msgType, callback);
     }
 
     /**
      * Registers a listener for application events.
-     * @param {(message: BaseMessage) => void} callback - Handler receives the full message object.
+     * @param {MessageCallback} callback - Handler receives the full message object.
      */
     onEvent(callback) {
-        const type = EventMessage.msgType;
-        this.on(type, callback);
+        this.on(EventMessage.msgType, callback);
     }
 
     /**
      * Registers a listener for system status updates.
-     * @param {(message: BaseMessage) => void} callback - Handler receives the full message object.
+     * @param {MessageCallback} callback - Handler receives the full message object.
      */
     onStatus(callback) {
         this.on(StatusMessage.msgType, callback);
     }
 
+    /**
+     * Registers a listener for agents joining the channel.
+     * NOTE: The automatic reply (greeting) is handled internally.
+     * @param {MessageCallback} callback - Handler receives the HelloMessage object.
+     */
+    onHello(callback) {
+        this.on(HelloMessage.msgType, callback);
+    }
 
+    /**
+     * Registers a listener for agent's direct greeting replies.
+     * @param {MessageCallback} callback - Handler receives the GreetingMessage object.
+     */
+    onGreeting(callback) {
+        this.on(GreetingMessage.msgType, callback);
+    }
+
+    /**
+     * Registers a listener for agents announcing their departure.
+     * @param {MessageCallback} callback - Handler receives the GoodbyeMessage object.
+     */
+    onGoodbye(callback) {
+        this.on(GoodbyeMessage.msgType, callback);
+    }
 }

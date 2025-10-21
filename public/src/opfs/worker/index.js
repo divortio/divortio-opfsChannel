@@ -4,9 +4,11 @@
  */
 import { OPFSWorkerFile } from './opfsWorkerFile.js';
 import { OPFSWorkerDirectory } from './opfsWorkerDir.js';
+import { OPFSWorker } from './opfsWorker.js'; // <-- NEW IMPORT
 
 // Export the core classes for developers
 export {
     OPFSWorkerFile,
-    OPFSWorkerDirectory // <-- NEW EXPORT
+    OPFSWorkerDirectory,
+    OPFSWorker // <-- NEW EXPORT
 };

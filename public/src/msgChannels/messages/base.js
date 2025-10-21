@@ -24,13 +24,18 @@ import { pushID } from '../../vendor/pushID.js';
  * @returns {string} - agentID identifying the instance to the channel
  */
 const getAgentID = (agent) => {
-    if (typeof agent == 'string' && agent.length > 0) {
+    // Case 1: Already a valid, non-empty string ID
+    if (typeof agent === 'string' && agent.length > 0) {
         return agent;
     }
-    if (typeof agent !== 'object' && 'agentId' in agent && typeof agent.agentID !== 'string' && agent.agentID.length === 0) {
-        return agent.agentID
+    // Case 2: A MessageAgent-like object
+    if (typeof agent === 'object' && agent !== null &&
+        typeof agent.agentID === 'string' && agent.agentID.length > 0) {
+        return agent.agentID;
     }
-    throw new Error('BaseMessage requires a valid AgentID(string) or MessageAgent instance containing agentID (agent.agentID)');
+
+    // Default: Invalid input
+    throw new Error('BaseMessage requires a valid AgentID(string) or MessageAgent instance containing agentID (agent.agentID).');
 }
 
 /**
@@ -63,7 +68,7 @@ export class BaseMessage {
 
 
     /**
-     * optional metadata
+     * Optional metadata, guaranteed to be an object.
      * @type {object}
      */
     metadata;
@@ -102,10 +107,10 @@ export class BaseMessage {
      * @param {string| {agentID: string}} agent - The MessageAgent instance of the sender (MANDATORY).
      * @param {string} type - Defines the message's purpose (the routing key).
      * @param {object|string|number|boolean|null} [payload=null] - The data content of the message.
-     * @param {object|null} metadata - Optional metadata object containing message specific context like type of request.
+     * @param {object} [metadata={}] - Optional metadata object containing message specific context like type of request. Guaranteed to be an object.
      * @param {string|null} [toAgent=null] - Optional target AgentID for direct messaging.
      */
-    constructor(agent, type, payload, metadata = null, toAgent = null) {
+    constructor(agent, type, payload, metadata = {}, toAgent = null) {
         if (typeof type !== 'string' || type.length === 0) {
             throw new Error('BaseMessage requires a non-empty string type.');
         }
@@ -118,6 +123,6 @@ export class BaseMessage {
         this.payload = payload;
         this.agentID = getAgentID(agent);
         this.toAgent = toAgent;
-        this.metadata = metadata;
+        this.metadata = metadata; // Now defaults to {}
     }
 }
